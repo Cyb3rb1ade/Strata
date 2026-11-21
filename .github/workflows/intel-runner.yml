@@ -86,12 +86,13 @@ jobs:
           import json
           from strata_control import engine_component as ec
           from tools.strata_mcp import Strata
-          host = ec.detect_host()
+          plat = ec.host_platform()
+          backend, how = ec.detect_backend()
           hw = Strata().hardware(fresh=True)
-          print("detect_host:", json.dumps(host.__dict__, default=str))
+          print("host_platform:", plat, "detect_backend:", backend, how)
           print("Strata.hardware:", json.dumps(hw, default=str))
-          assert host.platform == "linux-x86_64", f"unexpected platform: {host.platform}"
-          assert host.backend == "sycl", f"expected sycl backend on Arc Pro B70, got {host.backend}"
+          assert plat == "linux-x86_64", f"unexpected platform: {plat}"
+          assert backend == "sycl", f"expected sycl backend on Arc Pro B70, got {backend} ({how})"
           gpus = hw.get("gpus") or []
           intel_gpus = [g for g in gpus if "intel" in (g.get("vendor") or g.get("name") or "").lower()]
           assert intel_gpus, f"no Intel GPU detected by Strata().hardware(): {hw}"
