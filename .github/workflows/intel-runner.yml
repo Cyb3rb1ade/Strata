@@ -3,7 +3,11 @@ name: Intel runner
 # Runs on the owner's self-hosted runner "Intel" (labels self-hosted, Linux, X64, Intel). Started by hand (Actions -> Intel runner ->
 # Run workflow) or by a push to the branch ci/intel-runner. There is NO pull_request trigger on purpose: this repo is public, and a
 # self-hosted runner must never run code from someone else's pull request.
-# Step 1 prints what the machine has (CPU, RAM, disk, GPU, oneAPI); step 2 runs the same fast checks as check.yml's Linux jobs.
+# Stage 1 prints what the machine has (CPU, RAM, disk, GPU, oneAPI, Docker);
+# Stage 2 (`b70-gpu`) validates real Intel Arc Pro B70 (Battlemage G31 / bmg_g31) GPU hardware, live v0.2.18 SYCL release packages
+# (`strata-engine` + `strata-hy4`), native bmg_g31 SG16 XMX & Qwen SYCL parity tests, real Hy4-Flash-Vision ViT inference, and
+# `ghcr.io/niko1221/strata:0.2.18-sycl` Docker GPU execution;
+# Stage 3 (`checks`) runs the same fast checks as check.yml's Linux jobs.
 
 on:
   workflow_dispatch:
@@ -31,22 +35,296 @@ jobs:
           echo "== isa";    grep -o -w -E 'avx2|avx512f|avx512_vnni|avx_vnni|amx_tile' /proc/cpuinfo | sort | uniq -c
           echo "== memory"; free -g
           echo "== disk";   df -h "$GITHUB_WORKSPACE" /tmp
-          echo "== gpu";    lspci 2>/dev/null | grep -i -E 'vga|display|3d'
+          echo "== gpu";    lspci -nn 2>/dev/null | grep -i -E 'vga|display|3d'
           ls -l /dev/dri 2>/dev/null
+          for c in /sys/class/drm/card*/device; do
+            [ -f "$c/vendor" ] && echo "  $c: vendor=$(cat "$c/vendor") device=$(cat "$c/device" 2>/dev/null)"
+          done
           command -v xpu-smi && xpu-smi discovery
           command -v sycl-ls && sycl-ls
           command -v clinfo && clinfo -l
           echo "== oneapi"; ls /opt/intel/oneapi 2>/dev/null
-          echo "== tools";  python3 --version; cmake --version | head -1; gcc --version | head -1; ninja --version; node --version; git --version
+          command -v ocloc && ocloc --version
+          command -v docker && docker --version
+          echo "== tools";  python3 --version; cmake --version | head -1; gcc --version | head -1; ninja --version; git --version
           echo "== runner"; echo "user $(id -un) groups $(id -Gn)"; echo "workspace $GITHUB_WORKSPACE"; ulimit -l
+
+  b70-gpu:
+    name: Intel Arc Pro B70 GPU & Docker
+    needs: info
+    runs-on: [self-hosted, Linux, X64, Intel]
+    timeout-minutes: 40
+    env:
+      NODE_OPTIONS: --use-system-ca
+      SSL_CERT_FILE: /etc/ssl/certs/ca-certificates.crt
+      REQUESTS_CA_BUNDLE: /etc/ssl/certs/ca-certificates.crt
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: 1. Hardware, PCI ID, SYCL & Strata GPU detection on Arc Pro B70
+        run: |
+          set -euo pipefail
+          set +u
+          [ -f /opt/intel/oneapi/setvars.sh ] && source /opt/intel/oneapi/setvars.sh --force >/dev/null 2>&1 || true
+          set -u
+          echo "== PCI & DRM =="
+          lspci -nn | grep -i -E 'vga|display|3d'
+          for c in /sys/class/drm/card*/device; do
+            [ -f "$c/vendor" ] && echo "  $c: vendor=$(cat "$c/vendor") device=$(cat "$c/device" 2>/dev/null)"
+          done
+          echo "== sycl-ls =="
+          command -v sycl-ls >/dev/null && sycl-ls || echo "(sycl-ls not on PATH)"
+          echo "== ocloc =="
+          if command -v ocloc >/dev/null; then
+            ocloc --version || true
+            ocloc ids bmg_g31 || true
+          fi
+          echo "== Strata host & GPU detection =="
+          PYTHONPATH="$PWD/terminal" python3 - <<'PY'
+          import json
+          from strata_control import engine_component as ec
+          from tools.strata_mcp import Strata
+          host = ec.detect_host()
+          hw = Strata().hardware(fresh=True)
+          print("detect_host:", json.dumps(host.__dict__, default=str))
+          print("Strata.hardware:", json.dumps(hw, default=str))
+          assert host.platform == "linux-x86_64", f"unexpected platform: {host.platform}"
+          assert host.backend == "sycl", f"expected sycl backend on Arc Pro B70, got {host.backend}"
+          gpus = hw.get("gpus") or []
+          intel_gpus = [g for g in gpus if "intel" in (g.get("vendor") or g.get("name") or "").lower()]
+          assert intel_gpus, f"no Intel GPU detected by Strata().hardware(): {hw}"
+          print("STRATA_B70_DETECT_OK:", intel_gpus)
+          PY
+
+      - name: 2. Live v0.2.18 install.sh & signed SYCL release packages (strata-engine + strata-hy4)
+        run: |
+          set -euo pipefail
+          SANDBOX="$RUNNER_TEMP/live-b70"
+          mkdir -p "$SANDBOX/home" "$SANDBOX/data" "$SANDBOX/bin" "$SANDBOX/pkgs"
+          export HOME="$SANDBOX/home"
+          export XDG_DATA_HOME="$SANDBOX/xdg-data"
+          export XDG_CONFIG_HOME="$SANDBOX/xdg-config"
+          export XDG_STATE_HOME="$SANDBOX/xdg-state"
+          export STRATA_DATA_DIR="$SANDBOX/data"
+          export STRATA_BIN_DIR="$SANDBOX/bin"
+
+          echo "== Run live install.sh from releases/latest =="
+          curl -fsSL --connect-timeout 20 --max-time 120 \
+            https://github.com/Niko1221/Strata/releases/latest/download/install.sh \
+            -o "$SANDBOX/install.sh"
+          sh "$SANDBOX/install.sh"
+          "$SANDBOX/bin/strata" --version
+
+          echo "== Fetch & cryptographically verify live v0.2.18 SYCL packages (strata-engine + strata-hy4) =="
+          STRATA_PY="$(ls "$SANDBOX"/data/terminal/*/python/bin/python3 | head -1)"
+          test -x "$STRATA_PY"
+          "$STRATA_PY" tools/docker/fetch-engines.py \
+            --release-tag v0.2.18 --flavors sycl --out "$SANDBOX/pkgs" > "$SANDBOX/fetch.out"
+          cat "$SANDBOX/fetch.out"
+          LINE="$(tail -1 "$SANDBOX/fetch.out")"
+          ENG_DIR="$(printf '%s\n' "$LINE" | cut -f3)"
+          HY4_DIR="$(printf '%s\n' "$LINE" | cut -f4)"
+          echo "ENG_DIR=$ENG_DIR"
+          echo "HY4_DIR=$HY4_DIR"
+          test -d "$ENG_DIR"
+          test -d "$HY4_DIR"
+
+          "$STRATA_PY" tools/packaging/package_engine.py --verify "$ENG_DIR"
+          "$STRATA_PY" tools/packaging/binary_deps.py "$ENG_DIR"
+          "$STRATA_PY" tools/packaging/package_engine.py --verify "$HY4_DIR"
+          "$STRATA_PY" tools/packaging/binary_deps.py "$HY4_DIR"
+
+          echo "== Smoke-check clean-env execution of both shipped SYCL binaries =="
+          env -i "$ENG_DIR/strata" --version
+          env -i "$HY4_DIR/strata-hy4" --version
+          env -i HY4S_ARCH=bmg "$HY4_DIR/strata-hy4" --version
+          test -x "$HY4_DIR/strata-hy4-bmg"
+          test -x "$HY4_DIR/strata-hy4-acm"
+
+          echo "== Verify strata-hy4 dispatcher auto-selects strata-hy4-bmg on Arc Pro B70 =="
+          if command -v strace >/dev/null 2>&1; then
+            strace -f -e trace=execve "$HY4_DIR/strata-hy4" --version 2>&1 | tee "$SANDBOX/dispatch.trace"
+            grep -q 'strata-hy4-bmg' "$SANDBOX/dispatch.trace"
+          else
+            # Confirm DRM device id is in Battlemage 0xE200..0xE2FF range with no Alchemist card
+            python3 - <<'PY'
+          import glob
+          devs = []
+          for v in sorted(glob.glob("/sys/class/drm/card*/device/vendor")):
+              d = v.replace("/vendor", "/device")
+              try:
+                  vid = int(open(v).read().strip(), 16)
+                  did = int(open(d).read().strip(), 16)
+                  devs.append((vid, did))
+              except Exception:
+                  pass
+          print("DRM PCI IDs:", [(hex(v), hex(d)) for v, d in devs])
+          assert any(v == 0x8086 and 0xE200 <= d <= 0xE2FF for v, d in devs), f"no Battlemage PCI ID in {devs}"
+          PY
+          fi
+          echo "HY4_DIR=$HY4_DIR" >> "$GITHUB_ENV"
+          echo "ENG_DIR=$ENG_DIR" >> "$GITHUB_ENV"
+
+      - name: 3. Native bmg_g31 SG16 XMX SYCL GPU tests on Arc Pro B70 (sy_probe, sy_ktest, sy_mla_test, sy_vit_test)
+        run: |
+          set -euo pipefail
+          set +u
+          source /opt/intel/oneapi/setvars.sh --force >/dev/null 2>&1 || true
+          unset OMP_PLACES OMP_PROC_BIND GOMP_CPU_AFFINITY KMP_AFFINITY
+          set -u
+
+          BUILD="$RUNNER_TEMP/b70-build"
+          OBJ="$BUILD/obj"
+          mkdir -p "$OBJ/zstd"
+          R="$PWD/engine"
+          H="$R/src/hy4flash"
+          Z="$R/third_party/zstd-dec"
+          INC="-I$R/include -I$H/sycl -I$H/run -I$R/third_party/stb -I$Z"
+
+          if command -v ocloc >/dev/null 2>&1 && ocloc ids bmg_g31 >/dev/null 2>&1; then
+            SYCL_TGT="-fsycl-targets=intel_gpu_bmg_g31,spir64"
+          else
+            SYCL_TGT="-fsycl-targets=spir64"
+          fi
+          BMG_FLAGS="-fsycl $SYCL_TGT -DHY4S_DISABLE_SG8 -DHY4S_ENABLE_SG16_XMX"
+          MKL_FLAGS=""
+          MKL_LIBS=""
+          if [ -n "${MKLROOT:-}" ] && [ -f "$MKLROOT/include/oneapi/mkl/blas.hpp" ]; then
+            MKL_FLAGS="-DHY4S_USE_ONEMKL -I$MKLROOT/include"
+            MKL_LIBS="-L$MKLROOT/lib -Wl,-rpath,$MKLROOT/lib -lmkl_sycl_blas -lmkl_intel_lp64 -lmkl_sequential -lmkl_core"
+          fi
+          echo "icpx=$(icpx --version | head -1)"
+          echo "BMG_FLAGS=$BMG_FLAGS MKL=$([ -n "$MKL_FLAGS" ] && echo ON || echo OFF)"
+
+          for f in \
+            "$Z/common/debug.c" "$Z/common/entropy_common.c" "$Z/common/error_private.c" \
+            "$Z/common/fse_decompress.c" "$Z/common/zstd_common.c" "$Z/common/xxhash.c" \
+            "$Z/decompress/huf_decompress.c" "$Z/decompress/zstd_ddict.c" \
+            "$Z/decompress/zstd_decompress.c" "$Z/decompress/zstd_decompress_block.c"; do
+            b="$(basename "$f" .c)"
+            gcc -O2 -fPIC -DZSTD_DISABLE_ASM=1 -DXXH_NAMESPACE=ZSTD_ -I"$Z" -I"$Z/common" -I"$Z/decompress" -c "$f" -o "$OBJ/zstd/$b.o"
+          done
+          g++ -O3 -std=c++17 -fPIC $INC -c "$R/src/artifact/strata_reader.cpp" -o "$OBJ/strata_reader.o"
+          g++ -O3 -std=c++17 -fPIC $INC -c "$R/src/quant/sk_codecs.cpp" -o "$OBJ/sk_codecs.o"
+
+          echo "== Compile sy_probe, sy_ktest, sy_mla_test, sy_vit_test in parallel =="
+          icpx -O3 -std=c++17 -Wno-deprecated-declarations $BMG_FLAGS $INC \
+            "$H/sycl/sy_probe.cpp" -lpthread -lm -o "$BUILD/sy_probe" &
+          P1=$!
+          icpx -O3 -std=c++17 -Wno-deprecated-declarations $BMG_FLAGS $MKL_FLAGS $INC \
+            "$H/sycl/sy_ktest.cpp" "$OBJ/sk_codecs.o" $MKL_LIBS -lpthread -lm -o "$BUILD/sy_ktest" &
+          P2=$!
+          icpx -O3 -std=c++17 -fiopenmp -Wno-deprecated-declarations $BMG_FLAGS $MKL_FLAGS $INC \
+            "$H/sycl/sy_mla_test.cpp" "$H/sycl/sy_mla.cpp" "$OBJ/sk_codecs.o" $MKL_LIBS -lpthread -lm -o "$BUILD/sy_mla_test" &
+          P3=$!
+          icpx -O3 -std=c++17 -Wno-deprecated-declarations $BMG_FLAGS $MKL_FLAGS $INC \
+            "$H/sycl/sy_vit_test.cpp" "$OBJ/strata_reader.o" "$OBJ/sk_codecs.o" "$OBJ/zstd/"*.o \
+            $MKL_LIBS -lpthread -lm -o "$BUILD/sy_vit_test" &
+          P4=$!
+          wait "$P1" "$P2" "$P3" "$P4"
+
+          export ONEAPI_DEVICE_SELECTOR=level_zero:gpu
+          echo "== Run sy_probe on live Arc Pro B70 (Level Zero) =="
+          "$BUILD/sy_probe"
+
+          echo "== Run sy_ktest (S2..S8 + RP SG16 XMX + router + rms) on live Arc Pro B70 =="
+          "$BUILD/sy_ktest"
+
+          echo "== Run sy_mla_test (Flash-MLA + quant_kvb) on live Arc Pro B70 =="
+          "$BUILD/sy_mla_test"
+
+          echo "== Download live Hy4-Flash-Vision.strata (934 MB) and run sy_vit_test + shipped strata-hy4 --info on B70 =="
+          VIS="$RUNNER_TEMP/live-b70/Hy4-Flash-Vision.strata"
+          curl -fsSL --connect-timeout 20 --speed-limit 1 --speed-time 60 --retry 2 \
+            "https://huggingface.co/strata-engine/Hy4-Flash-Strata/resolve/main/Hy4-Flash-Vision.strata" \
+            -o "$VIS"
+          env -i "$HY4_DIR/strata-hy4" --info "$VIS"
+
+          mkdir -p "$RUNNER_TEMP/live-b70/vit-out"
+          RGB="$RUNNER_TEMP/live-b70/test224.rgb"
+          python3 - <<PY
+          data = bytes((i * 73 + 17) & 255 for i in range(224 * 224 * 3))
+          open("$RGB", "wb").write(data)
+          PY
+          "$BUILD/sy_vit_test" "$VIS" "$RGB" 224 224 "$RUNNER_TEMP/live-b70/vit-out" 2
+          python3 - <<PY
+          import struct, math
+          raw = open("$RUNNER_TEMP/live-b70/vit-out/image_rows_gpu.npy", "rb").read()
+          assert raw[:6] == b"\x93NUMPY"
+          hl = struct.unpack("<H", raw[8:10])[0]
+          vals = struct.unpack("<" + "f" * ((len(raw) - 10 - hl) // 4), raw[10 + hl:])
+          assert len(vals) > 0 and all(math.isfinite(v) for v in vals), "non-finite ViT output!"
+          norm = math.sqrt(sum(v * v for v in vals))
+          print(f"Hy4-Flash-Vision B70 ViT output OK: {len(vals)} floats, L2={norm:.4f}")
+          assert norm > 1.0, f"unexpected near-zero ViT output: L2={norm}"
+          PY
+
+      - name: 4. Core Qwen3.8 SYCL GPU parity self-tests on Arc Pro B70 (engine/sycl)
+        run: |
+          set -euo pipefail
+          set +u
+          source /opt/intel/oneapi/setvars.sh --force >/dev/null 2>&1 || true
+          set -u
+          QBUILD="$RUNNER_TEMP/b70-build/qwen-sycl"
+          cmake -S engine/sycl -B "$QBUILD" -G Ninja \
+            -DCMAKE_CXX_COMPILER=icpx \
+            -DSTRATA_SYCL_PARITY=ON
+          cmake --build "$QBUILD" -j"$(nproc)" --target \
+            dequant_s2_parity s2_gemv_parity router_top10_parity rope_parity kv_q8_parity
+          export ONEAPI_DEVICE_SELECTOR=level_zero:gpu
+          ctest --test-dir "$QBUILD" --output-on-failure \
+            -R '^(dequant_s2_parity|s2_gemv_parity|router_top10_parity|rope_parity|kv_q8_parity)$'
+
+      - name: 5. Live ghcr.io/niko1221/strata:0.2.18-sycl Docker image & GPU compute check on Arc Pro B70
+        run: |
+          set -euo pipefail
+          IMAGE="ghcr.io/niko1221/strata:0.2.18-sycl"
+          docker --version
+          docker pull "$IMAGE"
+          docker image inspect "$IMAGE" --format 'id={{.Id}} size={{.Size}} version={{index .Config.Labels "org.opencontainers.image.version"}} flavor={{index .Config.Labels "com.strata.flavor"}}'
+
+          RENDER_GID="$(stat -c '%g' /dev/dri/renderD128)"
+          VIDEO_GID="$(stat -c '%g' /dev/dri/card0)"
+          docker run --rm \
+            --device /dev/dri \
+            --group-add "$RENDER_GID" --group-add "$VIDEO_GID" \
+            -v "$RUNNER_TEMP/b70-build:/probe:ro" \
+            --entrypoint bash \
+            "$IMAGE" -c '
+              set -euo pipefail
+              echo "== Container Terminal & Engines =="
+              /opt/strata/terminal/bin/strata --version
+              ENG="$(ls -d /opt/strata/components/engine/*-sycl | head -1)"
+              HY4="$(ls -d /opt/strata/components/shapes/hy4/engine/*-sycl | head -1)"
+              echo "ENG=$ENG"
+              echo "HY4=$HY4"
+              "$ENG/strata" --version
+              "$HY4/strata-hy4" --version
+              HY4S_ARCH=bmg "$HY4/strata-hy4" --version
+              echo "== Level Zero B70 probe inside container =="
+              /opt/strata/terminal/python/bin/python3 -c "import ctypes; ze = ctypes.CDLL(\"libze_loader.so.1\"); assert ze.zeInit(0) == 0, \"zeInit failed\"; n = ctypes.c_uint32(0); assert ze.zeDriverGet(ctypes.byref(n), None) == 0 and n.value >= 1; drivers = (ctypes.c_void_p * n.value)(); assert ze.zeDriverGet(ctypes.byref(n), drivers) == 0; nd = ctypes.c_uint32(0); assert ze.zeDeviceGet(drivers[0], ctypes.byref(nd), None) == 0 and nd.value >= 1; print(f\"Level Zero inside container OK: drivers={n.value} devices={nd.value}\")"
+              echo "== Real SYCL GPU kernel execution (sy_probe) inside container using bundled oneAPI libs =="
+              ONEAPI_DEVICE_SELECTOR=level_zero:gpu LD_LIBRARY_PATH="$HY4" /probe/sy_probe
+            '
+
+      - name: Cleanup B70 scratch & Docker image
+        if: always()
+        run: |
+          rm -rf "$RUNNER_TEMP/live-b70" "$RUNNER_TEMP/b70-build" || true
+          docker rmi ghcr.io/niko1221/strata:0.2.18-sycl >/dev/null 2>&1 || true
 
   checks:
     name: Checks / ${{ matrix.name }}
-    needs: info
+    needs: [info, b70-gpu]
+    if: ${{ !cancelled() && needs.info.result == 'success' }}
     runs-on: [self-hosted, Linux, X64, Intel]
     timeout-minutes: 90
     env:
       NODE_OPTIONS: --use-system-ca   # the JavaScript actions (checkout, upload-artifact) trust the machine's certificate store
+      SSL_CERT_FILE: /etc/ssl/certs/ca-certificates.crt
+      REQUESTS_CA_BUNDLE: /etc/ssl/certs/ca-certificates.crt
     strategy:
       fail-fast: false
       max-parallel: 1

@@ -46,8 +46,9 @@ class FindOnPath(unittest.TestCase):
         (self.dir / ".local" / "bin").mkdir(parents=True)
         exe = fake_cloudflared(self.dir / ".local" / "bin")
         places = access._cloudflared_places
-        with self.env(PATH=str(self.dir / "empty")), mock.patch.object(Path, "home", return_value=self.dir),                 mock.patch.object(access, "_cloudflared_places",     # a box with its own system cloudflared (/usr/bin) must not answer first
-                                  lambda: [p for p in places() if not p.replace("\\", "/").startswith(("/usr/", "/opt/", "/bin/"))]):
+        want_prefix = str(self.dir).replace("\\", "/") + "/"
+        with self.env(PATH=str(self.dir / "empty")), mock.patch.object(Path, "home", return_value=self.dir),                 mock.patch.object(access, "_cloudflared_places",     # a box with its own system cloudflared (/usr/bin) must not answer first; keep self.dir even if TMPDIR lives under /opt/
+                                  lambda: [p for p in places() if p.replace("\\", "/").startswith(want_prefix) or not p.replace("\\", "/").startswith(("/usr/", "/opt/", "/bin/"))]):
             self.assertEqual(access.find_cloudflared(), str(exe))
 
     def test_a_too_old_copy_is_passed_over(self):

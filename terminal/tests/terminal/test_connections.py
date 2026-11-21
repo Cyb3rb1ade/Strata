@@ -219,7 +219,7 @@ class ConnectionTests(unittest.TestCase):
             thread.join(timeout=2)
 
     def test_deeply_nested_telemetry_returns_one_redacted_error(self):
-        depth = 20000  # Python 3.13 parses 1100 levels; the recursion limit is reached at a few thousand on every version
+        depth = 100000  # Python 3.14 parses 20000 levels; 100000 hits RecursionError on every version (matches portable_monitor_smoke.py) and stays well under MAX_BODY (2 MiB)
         body = b"[" * depth + b"0" + b"]" * depth
 
         class Handler(BaseHTTPRequestHandler):
