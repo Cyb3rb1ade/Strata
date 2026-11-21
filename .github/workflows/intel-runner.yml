@@ -4,9 +4,9 @@ name: Intel runner
 # Run workflow) or by a push to the branch ci/intel-runner. There is NO pull_request trigger on purpose: this repo is public, and a
 # self-hosted runner must never run code from someone else's pull request.
 # Stage 1 prints what the machine has (CPU, RAM, disk, GPU, oneAPI, Docker);
-# Stage 2 (`b70-gpu`) validates real Intel Arc Pro B70 (Battlemage G31 / bmg_g31) GPU hardware, live v0.2.18 SYCL release packages
-# (`strata-engine` + `strata-hy4`), native bmg_g31 SG16 XMX & Qwen SYCL parity tests, real Hy4-Flash-Vision ViT inference, and
-# `ghcr.io/niko1221/strata:0.2.18-sycl` Docker GPU execution;
+# Stage 2 (`b70-gpu`) validates real Intel Arc Pro B70 (Battlemage G31 / bmg_g31) GPU hardware, native bmg_g31 SG16 XMX & Qwen SYCL
+# parity tests, `ghcr.io/niko1221/strata:0.2.18-sycl` Docker GPU execution, live v0.2.18 `install.sh` + signed SYCL release packages
+# (`strata-engine` + `strata-hy4`), and real `Hy4-Flash-Vision.strata` ViT inference;
 # Stage 3 (`checks`) runs the same fast checks as check.yml's Linux jobs.
 
 on:
@@ -99,76 +99,7 @@ jobs:
           print("STRATA_B70_DETECT_OK:", intel_gpus)
           PY
 
-      - name: 2. Live v0.2.18 install.sh & signed SYCL release packages (strata-engine + strata-hy4)
-        run: |
-          set -euo pipefail
-          SANDBOX="$RUNNER_TEMP/live-b70"
-          mkdir -p "$SANDBOX/home" "$SANDBOX/data" "$SANDBOX/bin" "$SANDBOX/pkgs"
-          export HOME="$SANDBOX/home"
-          export XDG_DATA_HOME="$SANDBOX/xdg-data"
-          export XDG_CONFIG_HOME="$SANDBOX/xdg-config"
-          export XDG_STATE_HOME="$SANDBOX/xdg-state"
-          export STRATA_DATA_DIR="$SANDBOX/data"
-          export STRATA_BIN_DIR="$SANDBOX/bin"
-
-          echo "== Run live install.sh from releases/latest =="
-          curl -fsSL --connect-timeout 20 --max-time 120 \
-            https://github.com/Niko1221/Strata/releases/latest/download/install.sh \
-            -o "$SANDBOX/install.sh"
-          sh "$SANDBOX/install.sh"
-          "$SANDBOX/bin/strata" --version
-
-          echo "== Fetch & cryptographically verify live v0.2.18 SYCL packages (strata-engine + strata-hy4) =="
-          STRATA_PY="$(ls "$SANDBOX"/data/terminal/*/python/bin/python3 | head -1)"
-          test -x "$STRATA_PY"
-          "$STRATA_PY" tools/docker/fetch-engines.py \
-            --release-tag v0.2.18 --flavors sycl --out "$SANDBOX/pkgs" > "$SANDBOX/fetch.out"
-          cat "$SANDBOX/fetch.out"
-          LINE="$(tail -1 "$SANDBOX/fetch.out")"
-          ENG_DIR="$(printf '%s\n' "$LINE" | cut -f3)"
-          HY4_DIR="$(printf '%s\n' "$LINE" | cut -f4)"
-          echo "ENG_DIR=$ENG_DIR"
-          echo "HY4_DIR=$HY4_DIR"
-          test -d "$ENG_DIR"
-          test -d "$HY4_DIR"
-
-          "$STRATA_PY" tools/packaging/package_engine.py --verify "$ENG_DIR"
-          "$STRATA_PY" tools/packaging/binary_deps.py "$ENG_DIR"
-          "$STRATA_PY" tools/packaging/package_engine.py --verify "$HY4_DIR"
-          "$STRATA_PY" tools/packaging/binary_deps.py "$HY4_DIR"
-
-          echo "== Smoke-check clean-env execution of both shipped SYCL binaries =="
-          env -i "$ENG_DIR/strata" --version
-          env -i "$HY4_DIR/strata-hy4" --version
-          env -i HY4S_ARCH=bmg "$HY4_DIR/strata-hy4" --version
-          test -x "$HY4_DIR/strata-hy4-bmg"
-          test -x "$HY4_DIR/strata-hy4-acm"
-
-          echo "== Verify strata-hy4 dispatcher auto-selects strata-hy4-bmg on Arc Pro B70 =="
-          if command -v strace >/dev/null 2>&1; then
-            strace -f -e trace=execve "$HY4_DIR/strata-hy4" --version 2>&1 | tee "$SANDBOX/dispatch.trace"
-            grep -q 'strata-hy4-bmg' "$SANDBOX/dispatch.trace"
-          else
-            # Confirm DRM device id is in Battlemage 0xE200..0xE2FF range with no Alchemist card
-            python3 - <<'PY'
-          import glob
-          devs = []
-          for v in sorted(glob.glob("/sys/class/drm/card*/device/vendor")):
-              d = v.replace("/vendor", "/device")
-              try:
-                  vid = int(open(v).read().strip(), 16)
-                  did = int(open(d).read().strip(), 16)
-                  devs.append((vid, did))
-              except Exception:
-                  pass
-          print("DRM PCI IDs:", [(hex(v), hex(d)) for v, d in devs])
-          assert any(v == 0x8086 and 0xE200 <= d <= 0xE2FF for v, d in devs), f"no Battlemage PCI ID in {devs}"
-          PY
-          fi
-          echo "HY4_DIR=$HY4_DIR" >> "$GITHUB_ENV"
-          echo "ENG_DIR=$ENG_DIR" >> "$GITHUB_ENV"
-
-      - name: 3. Native bmg_g31 SG16 XMX SYCL GPU tests on Arc Pro B70 (sy_probe, sy_ktest, sy_mla_test, sy_vit_test)
+      - name: 2. Native bmg_g31 SG16 XMX SYCL GPU tests on Arc Pro B70 (sy_probe, sy_ktest, sy_mla_test)
         run: |
           set -euo pipefail
           set +u
@@ -211,13 +142,13 @@ jobs:
           g++ -O3 -std=c++17 -fPIC $INC -c "$R/src/quant/sk_codecs.cpp" -o "$OBJ/sk_codecs.o"
 
           echo "== Compile sy_probe, sy_ktest, sy_mla_test, sy_vit_test in parallel =="
-          icpx -O3 -std=c++17 -Wno-deprecated-declarations $BMG_FLAGS $INC \
+          icpx -O3 -g -std=c++17 -Wno-deprecated-declarations $BMG_FLAGS $INC \
             "$H/sycl/sy_probe.cpp" -lpthread -lm -o "$BUILD/sy_probe" &
           P1=$!
-          icpx -O3 -std=c++17 -Wno-deprecated-declarations $BMG_FLAGS $MKL_FLAGS $INC \
+          icpx -O3 -g -std=c++17 -fiopenmp -Wno-deprecated-declarations $BMG_FLAGS $MKL_FLAGS $INC \
             "$H/sycl/sy_ktest.cpp" "$OBJ/sk_codecs.o" $MKL_LIBS -lpthread -lm -o "$BUILD/sy_ktest" &
           P2=$!
-          icpx -O3 -std=c++17 -fiopenmp -Wno-deprecated-declarations $BMG_FLAGS $MKL_FLAGS $INC \
+          icpx -O3 -g -std=c++17 -fiopenmp -Wno-deprecated-declarations $BMG_FLAGS $MKL_FLAGS $INC \
             "$H/sycl/sy_mla_test.cpp" "$H/sycl/sy_mla.cpp" "$OBJ/sk_codecs.o" $MKL_LIBS -lpthread -lm -o "$BUILD/sy_mla_test" &
           P3=$!
           icpx -O3 -std=c++17 -Wno-deprecated-declarations $BMG_FLAGS $MKL_FLAGS $INC \
@@ -227,42 +158,32 @@ jobs:
           wait "$P1" "$P2" "$P3" "$P4"
 
           export ONEAPI_DEVICE_SELECTOR=level_zero:gpu
-          echo "== Run sy_probe on live Arc Pro B70 (Level Zero) =="
-          "$BUILD/sy_probe"
+          fail=0
+          run_diag() {
+            local label="$1"; shift
+            echo "== $label =="
+            set +e
+            stdbuf -oL -eL "$@"
+            local rc=$?
+            set -e
+            echo "--> $label rc=$rc"
+            if [ "$rc" -ne 0 ]; then
+              fail=1
+              if [ "$rc" -ge 128 ] && command -v gdb >/dev/null 2>&1; then
+                echo "--> gdb backtrace for $label"
+                gdb -batch -ex run -ex "thread apply all bt 20" --args "$@" 2>&1 | tail -80 || true
+              fi
+            fi
+          }
 
-          echo "== Run sy_ktest (S2..S8 + RP SG16 XMX + router + rms) on live Arc Pro B70 =="
-          "$BUILD/sy_ktest"
+          run_diag "sy_probe (Level Zero B70)" "$BUILD/sy_probe"
+          run_diag "sy_ktest HY4S_ONEMKL=0 (native SG16 XMX B70)" env HY4S_ONEMKL=0 "$BUILD/sy_ktest"
+          run_diag "sy_ktest HY4S_ONEMKL=1 (oneMKL B70)" env HY4S_ONEMKL=1 "$BUILD/sy_ktest"
+          run_diag "sy_mla_test (Flash-MLA + quant_kvb B70)" "$BUILD/sy_mla_test"
+          exit "$fail"
 
-          echo "== Run sy_mla_test (Flash-MLA + quant_kvb) on live Arc Pro B70 =="
-          "$BUILD/sy_mla_test"
-
-          echo "== Download live Hy4-Flash-Vision.strata (934 MB) and run sy_vit_test + shipped strata-hy4 --info on B70 =="
-          VIS="$RUNNER_TEMP/live-b70/Hy4-Flash-Vision.strata"
-          curl -fsSL --connect-timeout 20 --speed-limit 1 --speed-time 60 --retry 2 \
-            "https://huggingface.co/strata-engine/Hy4-Flash-Strata/resolve/main/Hy4-Flash-Vision.strata" \
-            -o "$VIS"
-          env -i "$HY4_DIR/strata-hy4" --info "$VIS"
-
-          mkdir -p "$RUNNER_TEMP/live-b70/vit-out"
-          RGB="$RUNNER_TEMP/live-b70/test224.rgb"
-          python3 - <<PY
-          data = bytes((i * 73 + 17) & 255 for i in range(224 * 224 * 3))
-          open("$RGB", "wb").write(data)
-          PY
-          "$BUILD/sy_vit_test" "$VIS" "$RGB" 224 224 "$RUNNER_TEMP/live-b70/vit-out" 2
-          python3 - <<PY
-          import struct, math
-          raw = open("$RUNNER_TEMP/live-b70/vit-out/image_rows_gpu.npy", "rb").read()
-          assert raw[:6] == b"\x93NUMPY"
-          hl = struct.unpack("<H", raw[8:10])[0]
-          vals = struct.unpack("<" + "f" * ((len(raw) - 10 - hl) // 4), raw[10 + hl:])
-          assert len(vals) > 0 and all(math.isfinite(v) for v in vals), "non-finite ViT output!"
-          norm = math.sqrt(sum(v * v for v in vals))
-          print(f"Hy4-Flash-Vision B70 ViT output OK: {len(vals)} floats, L2={norm:.4f}")
-          assert norm > 1.0, f"unexpected near-zero ViT output: L2={norm}"
-          PY
-
-      - name: 4. Core Qwen3.8 SYCL GPU parity self-tests on Arc Pro B70 (engine/sycl)
+      - name: 3. Core Qwen3.8 SYCL GPU parity self-tests on Arc Pro B70 (engine/sycl)
+        if: ${{ !cancelled() }}
         run: |
           set -euo pipefail
           set +u
@@ -278,7 +199,8 @@ jobs:
           ctest --test-dir "$QBUILD" --output-on-failure \
             -R '^(dequant_s2_parity|s2_gemv_parity|router_top10_parity|rope_parity|kv_q8_parity)$'
 
-      - name: 5. Live ghcr.io/niko1221/strata:0.2.18-sycl Docker image & GPU compute check on Arc Pro B70
+      - name: 4. Live ghcr.io/niko1221/strata:0.2.18-sycl Docker image & GPU compute check on Arc Pro B70
+        if: ${{ !cancelled() }}
         run: |
           set -euo pipefail
           IMAGE="ghcr.io/niko1221/strata:0.2.18-sycl"
@@ -310,6 +232,81 @@ jobs:
               ONEAPI_DEVICE_SELECTOR=level_zero:gpu LD_LIBRARY_PATH="$HY4" /probe/sy_probe
             '
 
+      - name: 5. Live v0.2.18 install.sh, signed SYCL release packages & live Hy4-Flash-Vision.strata B70 ViT inference
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          set +u
+          source /opt/intel/oneapi/setvars.sh --force >/dev/null 2>&1 || true
+          set -u
+          SANDBOX="$RUNNER_TEMP/live-b70"
+          BUILD="$RUNNER_TEMP/b70-build"
+          mkdir -p "$SANDBOX/home" "$SANDBOX/data" "$SANDBOX/bin" "$SANDBOX/pkgs" "$SANDBOX/vit-out"
+          export HOME="$SANDBOX/home"
+          export XDG_DATA_HOME="$SANDBOX/xdg-data"
+          export XDG_CONFIG_HOME="$SANDBOX/xdg-config"
+          export XDG_STATE_HOME="$SANDBOX/xdg-state"
+          export STRATA_DATA_DIR="$SANDBOX/data"
+          export STRATA_BIN_DIR="$SANDBOX/bin"
+
+          echo "== Run live install.sh from releases/latest =="
+          curl -fsSL --connect-timeout 20 --max-time 120 \
+            https://github.com/Niko1221/Strata/releases/latest/download/install.sh \
+            -o "$SANDBOX/install.sh"
+          sh "$SANDBOX/install.sh"
+          "$SANDBOX/bin/strata" --version
+
+          echo "== Fetch & cryptographically verify live v0.2.18 SYCL packages (strata-engine + strata-hy4) =="
+          STRATA_PY="$(ls "$SANDBOX"/data/terminal/*/python/bin/python3 | head -1)"
+          test -x "$STRATA_PY"
+          "$STRATA_PY" tools/docker/fetch-engines.py \
+            --release-tag v0.2.18 --flavors sycl --out "$SANDBOX/pkgs" > "$SANDBOX/fetch.out"
+          cat "$SANDBOX/fetch.out"
+          LINE="$(tail -1 "$SANDBOX/fetch.out")"
+          ENG_DIR="$(printf '%s\n' "$LINE" | cut -f3)"
+          HY4_DIR="$(printf '%s\n' "$LINE" | cut -f4)"
+          test -d "$ENG_DIR"
+          test -d "$HY4_DIR"
+
+          "$STRATA_PY" tools/packaging/package_engine.py --verify "$ENG_DIR"
+          "$STRATA_PY" tools/packaging/binary_deps.py "$ENG_DIR"
+          "$STRATA_PY" tools/packaging/package_engine.py --verify "$HY4_DIR"
+          "$STRATA_PY" tools/packaging/binary_deps.py "$HY4_DIR"
+
+          echo "== Clean-env execution & B70 dispatcher verification =="
+          env -i "$ENG_DIR/strata" --version
+          env -i "$HY4_DIR/strata-hy4" --version
+          env -i HY4S_ARCH=bmg "$HY4_DIR/strata-hy4" --version
+          if command -v strace >/dev/null 2>&1; then
+            strace -f -e trace=execve "$HY4_DIR/strata-hy4" --version 2>&1 | tee "$SANDBOX/dispatch.trace"
+            grep -q 'strata-hy4-bmg' "$SANDBOX/dispatch.trace"
+          fi
+
+          echo "== Download live Hy4-Flash-Vision.strata (934 MB) & run B70 ViT GPU inference =="
+          VIS="$SANDBOX/Hy4-Flash-Vision.strata"
+          curl -fsSL --connect-timeout 20 --speed-limit 1 --speed-time 60 --retry 2 \
+            "https://huggingface.co/strata-engine/Hy4-Flash-Strata/resolve/main/Hy4-Flash-Vision.strata" \
+            -o "$VIS"
+          env -i "$HY4_DIR/strata-hy4" --info "$VIS"
+
+          RGB="$SANDBOX/test224.rgb"
+          python3 - <<PY
+          data = bytes((i * 73 + 17) & 255 for i in range(224 * 224 * 3))
+          open("$RGB", "wb").write(data)
+          PY
+          ONEAPI_DEVICE_SELECTOR=level_zero:gpu stdbuf -oL -eL "$BUILD/sy_vit_test" "$VIS" "$RGB" 224 224 "$SANDBOX/vit-out" 2
+          python3 - <<PY
+          import struct, math
+          raw = open("$SANDBOX/vit-out/image_rows_gpu.npy", "rb").read()
+          assert raw[:6] == b"\x93NUMPY"
+          hl = struct.unpack("<H", raw[8:10])[0]
+          vals = struct.unpack("<" + "f" * ((len(raw) - 10 - hl) // 4), raw[10 + hl:])
+          assert len(vals) > 0 and all(math.isfinite(v) for v in vals), "non-finite ViT output!"
+          norm = math.sqrt(sum(v * v for v in vals))
+          print(f"Hy4-Flash-Vision B70 ViT output OK: {len(vals)} floats, L2={norm:.4f}")
+          assert norm > 1.0, f"unexpected near-zero ViT output: L2={norm}"
+          PY
+
       - name: Cleanup B70 scratch & Docker image
         if: always()
         run: |
@@ -319,7 +316,7 @@ jobs:
   checks:
     name: Checks / ${{ matrix.name }}
     needs: [info, b70-gpu]
-    if: ${{ !cancelled() && needs.info.result == 'success' }}
+    if: ${{ !cancelled() && needs.info.result == 'success' && needs.b70-gpu.result == 'success' }}
     runs-on: [self-hosted, Linux, X64, Intel]
     timeout-minutes: 90
     env:
