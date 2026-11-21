@@ -178,7 +178,15 @@ jobs:
 
           run_diag "sy_probe (Level Zero B70)" "$BUILD/sy_probe"
           run_diag "sy_ktest HY4S_ONEMKL=0 (native SG16 XMX B70)" env HY4S_ONEMKL=0 "$BUILD/sy_ktest"
-          run_diag "sy_ktest HY4S_ONEMKL=1 (oneMKL B70)" env HY4S_ONEMKL=1 "$BUILD/sy_ktest"
+          run_diag "sy_ktest HY4S_ONEMKL=0 HY4S_NO_XMX=1 (SG32 SIMT fallback B70)" env HY4S_ONEMKL=0 HY4S_NO_XMX=1 "$BUILD/sy_ktest"
+          echo "== Diagnostic: oneMKL on B70 across L0-V2 / L0-V1 / OpenCL =="
+          for mode in "L0-V2:level_zero:gpu:1" "L0-V1:level_zero:gpu:0" "OpenCL:opencl:gpu:0"; do
+            lbl="${mode%%:*}"; rest="${mode#*:}"; sel="${rest%:*}"; v2="${rest##*:}"
+            set +e
+            ONEAPI_DEVICE_SELECTOR="$sel" UR_LOADER_USE_LEVEL_ZERO_V2="$v2" HY4S_ONEMKL=1 stdbuf -oL -eL "$BUILD/sy_ktest" | tail -10
+            echo "--> sy_ktest oneMKL ($lbl) rc=${PIPESTATUS[0]}"
+            set -e
+          done
           run_diag "sy_mla_test (Flash-MLA + quant_kvb B70)" "$BUILD/sy_mla_test"
           exit "$fail"
 
@@ -228,8 +236,14 @@ jobs:
               HY4S_ARCH=bmg "$HY4/strata-hy4" --version
               echo "== Level Zero B70 probe inside container =="
               /opt/strata/terminal/python/bin/python3 -c "import ctypes; ze = ctypes.CDLL(\"libze_loader.so.1\"); assert ze.zeInit(0) == 0, \"zeInit failed\"; n = ctypes.c_uint32(0); assert ze.zeDriverGet(ctypes.byref(n), None) == 0 and n.value >= 1; drivers = (ctypes.c_void_p * n.value)(); assert ze.zeDriverGet(ctypes.byref(n), drivers) == 0; nd = ctypes.c_uint32(0); assert ze.zeDeviceGet(drivers[0], ctypes.byref(nd), None) == 0 and nd.value >= 1; print(f\"Level Zero inside container OK: drivers={n.value} devices={nd.value}\")"
-              echo "== Real SYCL GPU kernel execution (sy_probe) inside container using bundled oneAPI libs =="
+              echo "== Real SYCL GPU kernel execution (sy_probe + sy_ktest) inside container using bundled oneAPI 2026.1 libs =="
               ONEAPI_DEVICE_SELECTOR=level_zero:gpu LD_LIBRARY_PATH="$HY4" /probe/sy_probe
+              set +e
+              ONEAPI_DEVICE_SELECTOR=level_zero:gpu LD_LIBRARY_PATH="$HY4" HY4S_ONEMKL=0 /probe/sy_ktest | tail -6
+              echo "container sy_ktest ONEMKL=0 rc=${PIPESTATUS[0]}"
+              ONEAPI_DEVICE_SELECTOR=level_zero:gpu LD_LIBRARY_PATH="$HY4" HY4S_ONEMKL=1 /probe/sy_ktest | tail -6
+              echo "container sy_ktest ONEMKL=1 rc=${PIPESTATUS[0]}"
+              set -e
             '
 
       - name: 5. Live v0.2.18 install.sh, signed SYCL release packages & live Hy4-Flash-Vision.strata B70 ViT inference
@@ -287,7 +301,7 @@ jobs:
           curl -fsSL --connect-timeout 20 --speed-limit 1 --speed-time 60 --retry 2 \
             "https://huggingface.co/strata-engine/Hy4-Flash-Strata/resolve/main/Hy4-Flash-Vision.strata" \
             -o "$VIS"
-          env -i "$HY4_DIR/strata-hy4" --info "$VIS"
+          ls -lh "$VIS"
 
           RGB="$SANDBOX/test224.rgb"
           python3 - <<PY
